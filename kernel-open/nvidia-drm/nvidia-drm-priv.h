@@ -34,6 +34,7 @@
 
 #include <drm/drm_device.h>
 #include <drm/drm_gem.h>
+#include <linux/workqueue.h>
 
 #include "nvidia-drm-os-interface.h"
 
@@ -230,6 +231,7 @@ struct nv_drm_device {
     NvU64 vtFbSize;
 
     nv_drm_workthread vblank_worker;
+    struct workqueue_struct *semsurf_wq;
 
     struct mutex drm_lut_surface_pool_mutex;
     struct list_head drm_lut_surface_pool;

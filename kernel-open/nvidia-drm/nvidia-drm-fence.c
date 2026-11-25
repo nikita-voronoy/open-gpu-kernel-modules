@@ -34,7 +34,9 @@
 #include "nvidia-dma-resv-helper.h"
 #include "nv_drm_common_ioctl.h"
 
+#include <linux/completion.h>
 #include <linux/dma-fence.h>
+#include <linux/workqueue.h>
 
 #if defined(NV_DRM_SYNCOBJ_FEATURES_PRESENT)
 #include <drm/drm_syncobj.h>
@@ -623,14 +625,14 @@ struct nv_drm_semsurf_fence {
 
 struct nv_drm_semsurf_fence_callback {
     struct nv_drm_semsurf_fence_ctx *ctx;
-    nv_drm_work work;
+    struct work_struct work;
     NvU64 wait_value;
 };
 
 struct nv_drm_sync_fd_wait_data {
     struct dma_fence_cb dma_fence_cb;
     struct nv_drm_semsurf_fence_ctx *ctx;
-    nv_drm_work work; /* Deferred second half of fence wait callback */
+    struct work_struct work; /* Deferred second half of fence wait callback */
 
     /* Could use a lockless list data structure here instead */
     struct list_head pending_node;
@@ -653,15 +655,16 @@ struct nv_drm_semsurf_fence_ctx {
     } pSemMapping;
     volatile NvU64 *pMaxSubmittedMapping;
 
-    /* work thread for fence timeouts and waits */
-    nv_drm_workthread worker;
-
-    /* Timeout timer and associated workthread work */
+    /* Timeout timer and associated work item */
     nv_drm_timer timer;
-    nv_drm_work timeout_work;
+    struct work_struct timeout_work;
 
     /* Protects access to everything below */
     spinlock_t lock;
+
+    struct completion *shutdown_done;
+    unsigned int active_works;
+    bool shutting_down;
 
     /* List of pending fences which are not yet signaled */
     struct list_head pending_fences;
@@ -788,14 +791,56 @@ __nv_drm_semsurf_force_complete_pending(struct nv_drm_semsurf_fence_ctx *ctx)
 static void
 __nv_drm_semsurf_ctx_reg_callbacks(struct nv_drm_semsurf_fence_ctx *ctx);
 
-static void
-__nv_drm_semsurf_ctx_fence_callback_work(void *data)
+static bool
+__nv_drm_semsurf_ctx_schedule_work(struct nv_drm_semsurf_fence_ctx *ctx,
+                                   struct work_struct *work)
 {
-    struct nv_drm_semsurf_fence_callback *callback = data;
+    struct nv_drm_device *nv_dev = ctx->base.nv_dev;
+    unsigned long flags;
+    bool accepted = false;
 
-    __nv_drm_semsurf_ctx_reg_callbacks(callback->ctx);
+    spin_lock_irqsave(&ctx->lock, flags);
+    if (!ctx->shutting_down) {
+        accepted = true;
+        if (queue_work(nv_dev->semsurf_wq, work)) {
+            ctx->active_works++;
+        }
+    }
+    spin_unlock_irqrestore(&ctx->lock, flags);
+
+    return accepted;
+}
+
+static void
+__nv_drm_semsurf_ctx_finish_work(struct nv_drm_semsurf_fence_ctx *ctx)
+{
+    struct completion *done = NULL;
+    unsigned long flags;
+
+    spin_lock_irqsave(&ctx->lock, flags);
+    NV_DRM_WARN(ctx->active_works == 0);
+    if (--ctx->active_works == 0 && ctx->shutting_down) {
+        done = ctx->shutdown_done;
+    }
+    spin_unlock_irqrestore(&ctx->lock, flags);
+
+    if (done) {
+        complete(done);
+    }
+}
+
+static void
+__nv_drm_semsurf_ctx_fence_callback_work(struct work_struct *work)
+{
+    struct nv_drm_semsurf_fence_callback *callback =
+        container_of(work, typeof(*callback), work);
+    struct nv_drm_semsurf_fence_ctx *ctx = callback->ctx;
+
+    __nv_drm_semsurf_ctx_reg_callbacks(ctx);
 
     nv_drm_free(callback);
+
+    __nv_drm_semsurf_ctx_finish_work(ctx);
 }
 
 static struct nv_drm_semsurf_fence_callback*
@@ -809,9 +854,8 @@ __nv_drm_semsurf_new_callback(struct nv_drm_semsurf_fence_ctx *ctx)
     }
 
     newCallback->ctx = ctx;
-    nv_drm_workthread_work_init(&newCallback->work,
-                                __nv_drm_semsurf_ctx_fence_callback_work,
-                                newCallback);
+    INIT_WORK(&newCallback->work,
+              __nv_drm_semsurf_ctx_fence_callback_work);
 
     return newCallback;
 }
@@ -930,7 +974,7 @@ __nv_drm_semsurf_ctx_callback(void *data)
      */
     __nv_drm_semsurf_ctx_process_completed(ctx, NULL, NULL);
 
-    if (!nv_drm_workthread_add_work(&ctx->worker, &callback->work)) {
+    if (!__nv_drm_semsurf_ctx_schedule_work(ctx, &callback->work)) {
         /*
          * The context is shutting down. It will force-signal all fences when
          * doing so, so there's no need for any more callback handling.
@@ -1123,14 +1167,29 @@ static void __nv_drm_semsurf_fence_ctx_destroy(
     struct nv_drm_semsurf_fence_ctx *ctx =
         to_semsurf_fence_ctx(nv_fence_context);
     struct NvKmsKapiSemaphoreSurfaceCallback *pendingNvKmsCallback;
+    DECLARE_COMPLETION_ONSTACK(shutdown_done);
     NvU64 pendingWaitValue;
     unsigned long flags;
+    bool need_wait = false;
 
     /*
-     * The workthread must be shut down before the timer is stopped to ensure
+     * Prevent new work items from being queued and wait for any in-flight
+     * work items on the shared workqueue before stopping the timer, ensuring
      * the timer does not queue work that restarts itself.
      */
-    nv_drm_workthread_shutdown(&ctx->worker);
+    spin_lock_irqsave(&ctx->lock, flags);
+    ctx->shutting_down = true;
+    if (ctx->active_works > 0) {
+        ctx->shutdown_done = &shutdown_done;
+        need_wait = true;
+    }
+    spin_unlock_irqrestore(&ctx->lock, flags);
+
+    if (need_wait) {
+        wait_for_completion(&shutdown_done);
+    }
+
+    cancel_work_sync(&ctx->timeout_work);
 
     nv_timer_delete_sync(&ctx->timer.kernel_timer);
 
@@ -1161,7 +1220,8 @@ static void __nv_drm_semsurf_fence_ctx_destroy(
     nvKms->freeSemaphoreSurface(nv_dev->pDevice, ctx->pSemSurface);
 
     /*
-     * Now that the semaphore surface, the timer, and the workthread are gone:
+     * Now that the semaphore surface, the timer, and all deferred work items
+     * are gone:
      *
      * -No more RM/NVKMS callbacks will arrive, nor are any in progress. Freeing
      *  the semaphore surface cancels all its callbacks associated with this
@@ -1169,7 +1229,8 @@ static void __nv_drm_semsurf_fence_ctx_destroy(
      *
      * -No more timer callbacks will arrive, nor are any in flight.
      *
-     * -The workthread has been idled and is no longer running.
+     * -All deferred work items for this context have completed or been
+     *  canceled, and no new ones can be queued.
      *
      * Further, given the destructor is running, no other references to the
      * fence context exist, so this code can assume no concurrent access to the
@@ -1188,9 +1249,10 @@ static void __nv_drm_semsurf_fence_ctx_destroy(
 }
 
 static void
-__nv_drm_semsurf_ctx_timeout_work(void *data)
+__nv_drm_semsurf_ctx_timeout_work(struct work_struct *work)
 {
-    struct nv_drm_semsurf_fence_ctx *ctx = data;
+    struct nv_drm_semsurf_fence_ctx *ctx =
+        container_of(work, typeof(*ctx), timeout_work);
 
     __nv_drm_semsurf_ctx_reg_callbacks(ctx);
 }
@@ -1200,9 +1262,11 @@ __nv_drm_semsurf_ctx_timeout_callback(nv_drm_timer *timer)
 {
     struct nv_drm_semsurf_fence_ctx *ctx =
         container_of(timer, typeof(*ctx), timer);
+    struct nv_drm_device *nv_dev = ctx->base.nv_dev;
+    unsigned long flags;
 
     /*
-     * Schedule work to register new waiter & timer on a worker thread.
+     * Schedule work to register new waiter & timer on the shared workqueue.
      *
      * It does not matter if this fails. There are two possible failure cases:
      *
@@ -1214,10 +1278,15 @@ __nv_drm_semsurf_ctx_timeout_callback(nv_drm_timer *timer)
      *   signalled, so no further callbacks or timeouts are needed.
      *
      * Note this work may schedule a new timeout timer. To ensure that doesn't
-     * happen while context shutdown is shutting down and idling the timer, the
-     * the worker thread must be shut down before the timer is stopped.
+     * happen while context shutdown is shutting down and idling the timer,
+     * new work submissions are blocked and in-flight work is drained before
+     * the timer is stopped.
      */
-    nv_drm_workthread_add_work(&ctx->worker, &ctx->timeout_work);
+    spin_lock_irqsave(&ctx->lock, flags);
+    if (!ctx->shutting_down) {
+        queue_work(nv_dev->semsurf_wq, &ctx->timeout_work);
+    }
+    spin_unlock_irqrestore(&ctx->lock, flags);
 }
 
 static struct nv_drm_fence_context_ops
@@ -1235,7 +1304,6 @@ __nv_drm_semsurf_fence_ctx_new(
     struct NvKmsKapiSemaphoreSurface *pSemSurface;
     uint8_t *semMapping;
     uint8_t *maxSubmittedMapping;
-    char worker_name[20+16+1]; /* strlen(nvidia-drm/timeline-) + 16 for %llx + NUL */
 
     pSemSurface = nvKms->importSemaphoreSurface(nv_dev->pDevice,
                                                 p->nvkms_params_ptr,
@@ -1284,22 +1352,11 @@ __nv_drm_semsurf_fence_ctx_new(
     INIT_LIST_HEAD(&ctx->pending_fences);
     INIT_LIST_HEAD(&ctx->pending_waits);
 
-    sprintf(worker_name, "nvidia-drm/timeline-%llx",
-            (long long unsigned)ctx->base.context);
-    if (!nv_drm_workthread_init(&ctx->worker, worker_name)) {
-        goto failed_alloc_worker;
-    }
-
-    nv_drm_workthread_work_init(&ctx->timeout_work,
-                                __nv_drm_semsurf_ctx_timeout_work,
-                                ctx);
+    INIT_WORK(&ctx->timeout_work, __nv_drm_semsurf_ctx_timeout_work);
 
     nv_drm_timer_setup(&ctx->timer, __nv_drm_semsurf_ctx_timeout_callback);
 
     return ctx;
-
-failed_alloc_worker:
-    nv_drm_free(ctx);
 
 failed_alloc_fence_context:
     nvKms->freeSemaphoreSurface(nv_dev->pDevice, pSemSurface);
@@ -1572,12 +1629,11 @@ __nv_drm_semsurf_free_wait_data(struct nv_drm_sync_fd_wait_data *wait_data)
 }
 
 static void
-__nv_drm_semsurf_wait_fence_work_cb
+__nv_drm_semsurf_do_wait_fence
 (
-    void *arg
+    struct nv_drm_sync_fd_wait_data *wait_data
 )
 {
-    struct nv_drm_sync_fd_wait_data *wait_data = arg;
     struct nv_drm_semsurf_fence_ctx *ctx = wait_data->ctx;
     struct nv_drm_device *nv_dev = ctx->base.nv_dev;
     NvKmsKapiRegisterWaiterResult ret;
@@ -1605,6 +1661,21 @@ __nv_drm_semsurf_wait_fence_work_cb
 }
 
 static void
+__nv_drm_semsurf_wait_fence_work_cb
+(
+    struct work_struct *work
+)
+{
+    struct nv_drm_sync_fd_wait_data *wait_data =
+        container_of(work, typeof(*wait_data), work);
+    struct nv_drm_semsurf_fence_ctx *ctx = wait_data->ctx;
+
+    __nv_drm_semsurf_do_wait_fence(wait_data);
+
+    __nv_drm_semsurf_ctx_finish_work(ctx);
+}
+
+static void
 __nv_drm_semsurf_wait_fence_cb
 (
     struct dma_fence *fence,
@@ -1621,7 +1692,7 @@ __nv_drm_semsurf_wait_fence_cb
      * could mean arriving here directly from RM's top/bottom half
      * handler when the fence being waited on came from an RM-managed GPU.
      */
-    if (!nv_drm_workthread_add_work(&ctx->worker, &wait_data->work)) {
+    if (!__nv_drm_semsurf_ctx_schedule_work(ctx, &wait_data->work)) {
         /*
          * The context is shutting down. RM would likely just drop
          * the wait anyway as part of that, so do nothing. Either the
@@ -1706,9 +1777,7 @@ int nv_drm_semsurf_fence_wait_ioctl(struct drm_device *dev,
     wait_data->ctx = ctx;
     wait_data->pre_wait_value = p->pre_wait_value;
     wait_data->post_wait_value = p->post_wait_value;
-    nv_drm_workthread_work_init(&wait_data->work,
-                                __nv_drm_semsurf_wait_fence_work_cb,
-                                wait_data);
+    INIT_WORK(&wait_data->work, __nv_drm_semsurf_wait_fence_work_cb);
 
     spin_lock_irqsave(&ctx->lock, flags);
     list_add(&wait_data->pending_node, &ctx->pending_waits);
@@ -1729,7 +1798,7 @@ int nv_drm_semsurf_fence_wait_ioctl(struct drm_device *dev,
 
        /* Execute second half of wait immediately, avoiding the worker thread */
        dma_fence_put(fence);
-        __nv_drm_semsurf_wait_fence_work_cb(wait_data);
+       __nv_drm_semsurf_do_wait_fence(wait_data);
     }
 
     ret = 0;

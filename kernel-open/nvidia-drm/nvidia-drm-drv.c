@@ -906,6 +906,21 @@ static int nv_drm_dev_load(struct drm_device *dev)
     }
 #endif
 
+    nv_dev->semsurf_wq = alloc_workqueue("nvidia-drm-semsurf",
+                                         WQ_UNBOUND | WQ_HIGHPRI, 0);
+    if (nv_dev->semsurf_wq == NULL) {
+#if defined(NV_DRM_FBDEV_AVAILABLE)
+        if (nv_dev->hasFramebufferConsole) {
+            nvKms->releaseOwnership(pDevice);
+        }
+#endif
+        nvKms->freeDevice(pDevice);
+        NV_DRM_DEV_LOG_ERR(
+            nv_dev,
+            "Failed to allocate semaphore surface workqueue");
+        return -ENOMEM;
+    }
+
     mutex_lock(&nv_dev->lock);
 
     /* Set NvKmsKapiDevice */
@@ -976,6 +991,8 @@ static int nv_drm_dev_load(struct drm_device *dev)
             nvKms->releaseOwnership(nv_dev->pDevice);
         }
 #endif
+        destroy_workqueue(nv_dev->semsurf_wq);
+        nv_dev->semsurf_wq = NULL;
         nvKms->freeDevice(nv_dev->pDevice);
         NV_DRM_DEV_LOG_ERR(nv_dev, "Failed to create DRM properties");
         return -ENODEV;
@@ -2314,6 +2331,11 @@ failed_drm_load:
 
     drm_dev_put(dev);
 
+    if (nv_dev->semsurf_wq != NULL) {
+        destroy_workqueue(nv_dev->semsurf_wq);
+        nv_dev->semsurf_wq = NULL;
+    }
+
 failed_drm_alloc:
 
     nv_drm_free(nv_dev);
@@ -2388,6 +2410,10 @@ static void nv_drm_dev_destroy(struct nv_drm_device *nv_dev)
 
     nv_drm_dev_unload(dev);
     drm_dev_put(dev);
+    if (nv_dev->semsurf_wq != NULL) {
+        destroy_workqueue(nv_dev->semsurf_wq);
+        nv_dev->semsurf_wq = NULL;
+    }
     nv_drm_free(nv_dev);
 }
 
